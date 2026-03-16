@@ -88,21 +88,9 @@ git clone https://github.com/Maitreyee-07/BeatSync-Hats.git
 ---
 
 ## 📸 Prototype
-images/demo1.jpg
+Images/Prototype.jpeg
 
 
----
-
-## 📂 Repository Structure
-beat-sensing-led-hat
-│
-├── Source
-│ └── SoundReactive.ino
-│
-├── Demo
-│ └── demo1.jpg
-│
-└── README.md
 
 
 ---
