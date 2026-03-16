@@ -87,13 +87,6 @@ git clone https://github.com/Maitreyee-07/BeatSync-Hats.git
 
 ---
 
-## 📸 Prototype
-Images/Prototype.jpeg
-
-
-
-
----
 
 ## 🔧 Future Improvements
 
