@@ -1,395 +1,350 @@
+#include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 
-#define MIC_PIN     A1
+// ── Hardware ──────────────────────────────────────────────────────────────────
+#define BASS_PIN    A0
+#define TREBLE_PIN  A1
 #define LED_PIN     6
-#define LED_COUNT   80
+#define LED_COUNT   100
 
-#define N              64
-#define FS             9600
+// ── Sampling ──────────────────────────────────────────────────────────────────
+#define N_SAMPLES  64
+#define SAMPLE_US  250
 
-#define LOCAL_BEAT_RATIO   1.5
-#define MIN_BEAT_INTERVAL  200
-#define TRANSIENT_RISE     1.15
-#define LOCAL_AVG_LEN      43
-#define MIN_ABS_RMS        5.0
+// ── Beat detection ────────────────────────────────────────────────────────────
+#define LOCAL_AVG_LEN    20
+#define BEAT_RATIO       1.25f   // FIXED: was 1.4f — lower = fires on quieter beats
+#define MIN_BEAT_MS      300
+#define SILENCE_THRESH   2.0f    // FIXED: was 10.0f — much lower for sensitive mics
+#define SILENCE_FRAMES   30
+#define BEAT_TIMEOUT_MS  3000
 
-#define BPM_HISTORY        8
-#define SLOW_BPM_THRESH    80
-#define FAST_BPM_THRESH    140
+// ── BPM history ───────────────────────────────────────────────────────────────
+#define BPM_HIST  6
 
-#define SLOW_SUSTAIN_MS    800
-#define MEDIUM_SUSTAIN_MS  350
-#define FAST_SUSTAIN_MS    150
+// ── Pattern switching ─────────────────────────────────────────────────────────
+#define CHASE_TREBLE_THRESH  0.30f   // FIXED: was 0.35f — easier to trigger chase
+#define BPM_MIN              40.0f
+#define BPM_MAX              240.0f
 
-#define BEAT_MODE_WINDOW    3000
-#define BEAT_MODE_MIN_COUNT 3
-#define BEAT_DROPOUT_MS     2500
+// ── Pattern 0: Beat Flash ─────────────────────────────────────────────────────
+#define FLASH_HOLD_MS  80
+#define FLASH_FADE_MS  200
 
-#define MUSIC_SILENCE_RMS  4.0
-#define MUSIC_SMOOTH       0.15
+// ── Pattern 2: Chase ──────────────────────────────────────────────────────────
+#define CHASE_WINDOW    5
+#define CHASE_BASE_MS  40
 
-#define MASTER_BRIGHTNESS  55
+// ── Envelope decay / attack ───────────────────────────────────────────────────
+// FIXED: was bassMax * 0.995 + bassRms * 0.005 — attack (0.005) was far too slow.
+// Raising attack to 0.05 lets the envelope track rising signals 10× faster,
+// which means normBass/normTreble actually reach meaningful values instead of
+// sitting near 0 while bassMax drags far above the signal.
+#define ENV_DECAY  0.990f   // was 0.995f — slightly faster envelope release
+#define ENV_ATTACK 0.050f   // was 0.005f — much faster envelope attack
 
+// ── Beat normalisation gate ───────────────────────────────────────────────────
+// FIXED: was 0.15f — on a weak mic normBass rarely exceeds this. Lowered to 0.08f.
+#define BEAT_NORM_GATE 0.08f
 
-#define MAX_LIT_LEDS       20
+// ─────────────────────────────────────────────────────────────────────────────
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-Adafruit_NeoPixel ring(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
-
-int16_t samples[N];
-float   localEnergyBuf[LOCAL_AVG_LEN];
-int     localEnergyIdx  = 0;
-float   localEnergySum  = 0;
-bool    localEnergyFull = false;
-
-
-float         prevRMS             = 0;
-unsigned long lastBeatTime        = 0;
-float         beatIntervals[BPM_HISTORY];
-int           bpmIdx              = 0;
-bool          bpmReady            = false;
-float         currentBPM          = 0;
-
-
-int           currentMode         = 0;
-unsigned long lastBeatDetectedTime = 0;
-unsigned long beatTimestamps[8];
-int           beatTsIdx           = 0;
-
-unsigned long beatOnTime   = 0;
-int           sustainMs    = 300;
-int           chasePos     = 0;
-int           colorPhase   = 0;
-float         musicBrightness = 0;
-float         hueShift     = 0;
-
-uint32_t hsv(float h, float s, float v) {
-  h = fmod(h, 360.0);
-  if (h < 0) h += 360;
-  float c = v * s;
-  float x = c * (1.0 - fabs(fmod(h / 60.0, 2.0) - 1.0));
-  float m = v - c;
-  float r = 0, g = 0, b = 0;
-  if      (h < 60)  { r=c; g=x; b=0; }
-  else if (h < 120) { r=x; g=c; b=0; }
-  else if (h < 180) { r=0; g=c; b=x; }
-  else if (h < 240) { r=0; g=x; b=c; }
-  else if (h < 300) { r=x; g=0; b=c; }
-  else              { r=c; g=0; b=x; }
-  return ring.Color(
-    (uint8_t)((r + m) * 255),
-    (uint8_t)((g + m) * 255),
-    (uint8_t)((b + m) * 255)
-  );
-}
-
-
-void captureSamples() {
-  for (int i = 0; i < N; i++) samples[i] = analogRead(MIC_PIN);
-}
-
-float getRMS() {
-  long sum = 0;
-  for (int i = 0; i < N; i++) sum += samples[i];
-  int16_t mean = sum / N;
-  float sumSq = 0;
-  for (int i = 0; i < N; i++) {
-    float d = samples[i] - mean;
-    sumSq += d * d;
-  }
-  return sqrt(sumSq / N);
-}
+// ── Rolling average buffer (bass channel) ────────────────────────────────────
+float   localBuf[LOCAL_AVG_LEN];
+uint8_t localIdx  = 0;
+float   localSum  = 0.0f;
+bool    localFull = false;
 
 float updateLocalAvg(float rms) {
-  localEnergySum -= localEnergyBuf[localEnergyIdx];
-  localEnergyBuf[localEnergyIdx] = rms;
-  localEnergySum += rms;
-  localEnergyIdx = (localEnergyIdx + 1) % LOCAL_AVG_LEN;
-  if (localEnergyIdx == 0) localEnergyFull = true;
-  int count = localEnergyFull ? LOCAL_AVG_LEN : (localEnergyIdx > 0 ? localEnergyIdx : LOCAL_AVG_LEN);
-  return (count > 0) ? (localEnergySum / count) : rms;
+  localSum -= localBuf[localIdx];
+  localBuf[localIdx] = rms;
+  localSum += rms;
+  localIdx++;
+  if (localIdx >= LOCAL_AVG_LEN) { localIdx = 0; localFull = true; }
+  uint8_t cnt = localFull ? LOCAL_AVG_LEN : (localIdx == 0 ? 1 : localIdx);
+  return localSum / cnt;
 }
 
+// ── BPM tracker ───────────────────────────────────────────────────────────────
+unsigned long beatIntervals[BPM_HIST];
+uint8_t       beatHistIdx = 0;
+bool          bpmReady    = false;
+float         currentBPM  = 0.0f;
+unsigned long lastBeatMs  = 0;
 
-void updateBPM(unsigned long intervalMs) {
-  beatIntervals[bpmIdx] = (float)intervalMs;
-  bpmIdx = (bpmIdx + 1) % BPM_HISTORY;
-  if (bpmIdx == 0) bpmReady = true;
-  int count = bpmReady ? BPM_HISTORY : bpmIdx;
-  if (count == 0) return;
-  float total = 0;
-  for (int i = 0; i < count; i++) total += beatIntervals[i];
-  currentBPM = 60000.0 / (total / count);
+void resetBpmState() {
+  bpmReady    = false;
+  currentBPM  = 0.0f;
+  lastBeatMs  = 0;
+  beatHistIdx = 0;
+  for (uint8_t i = 0; i < BPM_HIST; i++) beatIntervals[i] = 0;
 }
 
-bool detectBeat(float rms, float localAvg) {
-  if (rms < MIN_ABS_RMS)                             return false;
-  if (rms < localAvg * LOCAL_BEAT_RATIO)              return false;
-  if (prevRMS > 0 && rms < prevRMS * TRANSIENT_RISE) return false;
-  unsigned long now = millis();
-  if ((now - lastBeatTime) < MIN_BEAT_INTERVAL)       return false;
-  if (lastBeatTime > 0) updateBPM(now - lastBeatTime);
-  lastBeatTime = now;
-  return true;
-}
+void recordBeat(unsigned long now) {
+  if (lastBeatMs > 0) {
+    unsigned long interval = now - lastBeatMs;
+    beatIntervals[beatHistIdx] = interval;
+    beatHistIdx = (beatHistIdx + 1) % BPM_HIST;
+    if (beatHistIdx == 0) bpmReady = true;
 
-
-int determineMode(float rms, bool beat) {
-  unsigned long now = millis();
-  if (beat) {
-    lastBeatDetectedTime = now;
-    beatTimestamps[beatTsIdx % 8] = now;
-    beatTsIdx++;
+    uint8_t cnt = bpmReady ? BPM_HIST : beatHistIdx;
+    if (cnt > 0) {
+      unsigned long tot = 0;
+      for (uint8_t i = 0; i < cnt; i++) tot += beatIntervals[i];
+      currentBPM = 60000.0f / ((float)tot / (float)cnt);
+    }
   }
-  int recentBeats = 0;
-  for (int i = 0; i < 8; i++) {
-    if (beatTimestamps[i] > 0 &&
-        (now - beatTimestamps[i]) < (unsigned long)BEAT_MODE_WINDOW)
-      recentBeats++;
-  }
-  if (rms < MUSIC_SILENCE_RMS)                                        return 0;
-  if (recentBeats >= BEAT_MODE_MIN_COUNT &&
-      (now - lastBeatDetectedTime) < (unsigned long)BEAT_DROPOUT_MS)  return 2;
-  return 1;
+  lastBeatMs = now;
 }
 
+// ── Signal globals ────────────────────────────────────────────────────────────
+// FIXED: was 10.0f — starting envelope at 10 means the first ~100 frames of
+// normBass/normTreble are suppressed below 0.1 even if the mic is loud.
+// Starting at 1.0f lets the envelope find the true peak immediately.
+float   bassMax      = 1.0f;   // was 10.0f
+float   trebleMax    = 1.0f;   // was 10.0f
+float   prevBassRms  = 0.0f;
+uint8_t silenceCount = 0;
 
-void renderSilence() {
-  musicBrightness = 0;
-  ring.clear();
-  ring.show();
+// ── RMS sampler ───────────────────────────────────────────────────────────────
+float sampleRMS(uint8_t pin) {
+  int  readings[N_SAMPLES];
+  long mean = 0;
+  for (uint8_t i = 0; i < N_SAMPLES; i++) {
+    readings[i] = analogRead(pin);
+    delayMicroseconds(SAMPLE_US);
+  }
+  for (uint8_t i = 0; i < N_SAMPLES; i++) mean += readings[i];
+  mean /= N_SAMPLES;
+  long sum = 0;
+  for (uint8_t i = 0; i < N_SAMPLES; i++) {
+    long d = readings[i] - mean;
+    sum += d * d;
+  }
+  return sqrt((float)sum / N_SAMPLES);
 }
 
+// ── Pattern 0 state ───────────────────────────────────────────────────────────
+unsigned long flashStartMs = 0;
+bool          flashActive  = false;
 
-void renderMusicOnly(float rms) {
-  float target = constrain((rms - MUSIC_SILENCE_RMS) * 8.0, 0, 255);
-  musicBrightness += (target - musicBrightness) * MUSIC_SMOOTH;
+// ── Pattern 2 state ───────────────────────────────────────────────────────────
+uint8_t chaseHead   = 0;
+int8_t  chaseDir    = 1;
+unsigned long lastChaseMs = 0;
 
-  if (musicBrightness < 4) {
-    ring.clear();
-    ring.show();
-    return;
-  }
-
-
-  hueShift += 0.3;
-  if (hueShift >= 360) hueShift -= 360;
-
-  float v = musicBrightness / 255.0;
-
-  ring.clear();
-
-  int offset = (millis() / 3000) % 4;
-
-  // Light every 4th LED = 20 LEDs max on 80-LED ring
-  for (int i = offset; i < LED_COUNT; i += 4) {
-    float ledHue = hueShift + (i * 4.5);
-    // Slight brightness wave so adjacent dots pulse differently
-    float wave   = 0.7 + 0.3 * sin((i / (float)LED_COUNT) * 2.0 * PI + hueShift * 0.03);
-    ring.setPixelColor(i, hsv(fmod(ledHue, 360), 1.0, v * wave));
-  }
-
-  ring.show();
+uint16_t lcgState = 42;
+uint8_t lcgNext() {
+  lcgState = lcgState * 25173u + 13849u;
+  return (uint8_t)(lcgState >> 8);
 }
 
-
-void triggerPatternSlow() {
-  ring.clear();
-
-  int origin = chasePos;
-  int reach  = MAX_LIT_LEDS / 2; // 10 LEDs each direction
-
-  for (int d = 0; d <= reach; d++) {
-    float fade = 1.0 - ((float)d / reach);
-    // Quadratic falloff for nicer glow shape
-    uint8_t v  = (uint8_t)(255.0 * fade * fade);
-
-    // Pure magenta: R + B, no green (saves green channel power)
-    uint8_t r = v;
-    uint8_t g = 0;
-    uint8_t b = (uint8_t)(v * 0.75);
-
-    ring.setPixelColor((origin + d) % LED_COUNT,             ring.Color(r, g, b));
-    ring.setPixelColor((origin - d + LED_COUNT) % LED_COUNT, ring.Color(r, g, b));
-  }
-
-  // Hot white-ish core (just this 1 pixel, acceptable cost)
-  ring.setPixelColor(origin, ring.Color(255, 30, 200));
-
-  ring.show();
-
-  // Advance origin slowly so each beat ripples from a new spot
-  chasePos = (chasePos + 8) % LED_COUNT;
-  sustainMs = SLOW_SUSTAIN_MS;
-}
-
-
-void triggerPatternMedium() {
-  // Aggressive trail decay (0.35 = trail gone in ~3 frames)
-  for (int i = 0; i < LED_COUNT; i++) {
-    uint32_t c = ring.getPixelColor(i);
-    ring.setPixelColor(i, ring.Color(
-      ((c >> 16) & 0xFF) * 0.35,
-      ((c >>  8) & 0xFF) * 0.35,
-      ( c        & 0xFF) * 0.35
-    ));
-  }
-
-  int p1 = chasePos;
-  int p2 = (chasePos + LED_COUNT / 2) % LED_COUNT;
-
-  // Comet 1 head: Cyan (G+B only — no red draw)
-  ring.setPixelColor(p1, ring.Color(0, 200, 255));
-  ring.setPixelColor((p1 - 1 + LED_COUNT) % LED_COUNT, ring.Color(0, 80, 130));
-  ring.setPixelColor((p1 - 2 + LED_COUNT) % LED_COUNT, ring.Color(0, 25, 50));
-
-  // Comet 2 head: Deep orange (R dominant, half G, no B)
-  ring.setPixelColor(p2, ring.Color(255, 110, 0));
-  ring.setPixelColor((p2 - 1 + LED_COUNT) % LED_COUNT, ring.Color(120, 45, 0));
-  ring.setPixelColor((p2 - 2 + LED_COUNT) % LED_COUNT, ring.Color(40, 14, 0));
-
-  ring.show();
-
-  int step = (bpmReady && currentBPM > 0)
-    ? constrain((int)(currentBPM / 35.0), 1, 5) : 2;
-  chasePos = (chasePos + step) % LED_COUNT;
-  sustainMs = MEDIUM_SUSTAIN_MS;
-}
-
-
-void triggerPatternFast() {
-  ring.clear();
-
-  // Hue cycles through spectrum: one full cycle every ~9 beats
-  float h = fmod(colorPhase * 40.0, 360.0);
-
-  // Offset shifts by 2 each beat so pattern appears to spin
-  int offset = (colorPhase * 2) % 4;
-
-  // Light every 4th LED starting from offset = 20 LEDs
-  for (int i = offset; i < LED_COUNT; i += 4) {
-    ring.setPixelColor(i, hsv(h, 1.0, 1.0));
-  }
-
-  ring.show();
-  colorPhase++;
-  sustainMs = FAST_SUSTAIN_MS;
-}
-
-
-void beatFadeOut() {
-  unsigned long elapsed = millis() - beatOnTime;
-  if (elapsed < (unsigned long)sustainMs) return;
-
-  unsigned long fadeElapsed = elapsed - sustainMs;
-  if (fadeElapsed > 120) {
-    ring.clear();
-    ring.show();
-    return;
-  }
-
-  float fadeRatio = 1.0 - (fadeElapsed / 120.0);
-  for (int i = 0; i < LED_COUNT; i++) {
-    uint32_t c = ring.getPixelColor(i);
-    ring.setPixelColor(i, ring.Color(
-      ((c >> 16) & 0xFF) * fadeRatio,
-      ((c >>  8) & 0xFF) * fadeRatio,
-      ( c        & 0xFF) * fadeRatio
-    ));
-  }
-  ring.show();
-}
-
+// ─────────────────────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
-  ring.begin();
-  ring.setBrightness(MASTER_BRIGHTNESS); // ~21% — key power saving
-  ring.clear();
-  ring.show();
+  for (uint8_t i = 0; i < LOCAL_AVG_LEN; i++) localBuf[i] = 0.0f;
+  resetBpmState();
 
-  
-  for (int i = 0; i < LED_COUNT; i += 4) {
-    ring.setPixelColor(i, ring.Color(180, 0, 80));
-    ring.show();
-    delay(18);
+  strip.begin();
+  strip.show();
+
+  // Prime rolling average — now uses ENV_ATTACK/DECAY so priming is consistent
+  for (uint8_t i = 0; i < LOCAL_AVG_LEN; i++) {
+    float r = sampleRMS(BASS_PIN);
+    updateLocalAvg(r);
+    // FIXED: use same envelope formula as loop() so priming doesn't diverge
+    bassMax = bassMax * ENV_DECAY + r * ENV_ATTACK;
+    if (r > bassMax) bassMax = r;
   }
-  delay(200);
-  ring.clear(); ring.show();
-  for (int i = 0; i < LED_COUNT; i += 4) {
-    ring.setPixelColor(i, ring.Color(0, 160, 180));
-    ring.show();
-    delay(18);
-  }
-  delay(200);
-  ring.clear(); ring.show();
-
-  memset(localEnergyBuf, 0, sizeof(localEnergyBuf));
-  memset(beatIntervals,  0, sizeof(beatIntervals));
-  memset(beatTimestamps, 0, sizeof(beatTimestamps));
-
-  Serial.println(">>> Warming up (keep quiet)...");
-  for (int i = 0; i < LOCAL_AVG_LEN; i++) {
-    captureSamples();
-    updateLocalAvg(getRMS());
-    delay(10);
-  }
-
-
-  Serial.println("Time(ms)  | Mode         | BPM");
-  Serial.println("----------|--------------|----");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 void loop() {
-  captureSamples();
-  float rms      = getRMS();
-  float localAvg = updateLocalAvg(rms);
+  unsigned long now = millis();
 
-  bool beat = detectBeat(rms, localAvg);
-  prevRMS = rms;
+  // ── 1. Sample both channels ───────────────────────────────────────────────
+  float bassRms   = sampleRMS(BASS_PIN);
+  float trebleRms = sampleRMS(TREBLE_PIN);
 
-  int mode = determineMode(rms, beat);
-  currentMode = mode;
+  // ── 2. Adaptive peak envelope ─────────────────────────────────────────────
+  // FIXED: ENV_ATTACK raised from 0.005 → 0.05 so the envelope rises quickly
+  // when signal increases, preventing normBass from being crushed near zero.
+  bassMax   = bassMax   * ENV_DECAY + bassRms   * ENV_ATTACK;
+  trebleMax = trebleMax * ENV_DECAY + trebleRms * ENV_ATTACK;
+  if (bassRms   > bassMax)   bassMax   = bassRms;
+  if (trebleRms > trebleMax) trebleMax = trebleRms;
 
-  if (mode == 0) {
-    renderSilence();
+  // FIXED: clamp envelope floor at 1.0 (was implicit via bassMax start of 10).
+  // Without a floor, bassMax can decay to near-zero during silence and then
+  // normBass will spike to 1.0 on the first tiny noise after silence, causing
+  // false beat detections.
+  if (bassMax   < 1.0f) bassMax   = 1.0f;
+  if (trebleMax < 1.0f) trebleMax = 1.0f;
 
-  } else if (mode == 1) {
-    renderMusicOnly(rms);
+  float normBass   = bassRms   / bassMax;
+  float normTreble = trebleRms / trebleMax;
+  float localAvg   = updateLocalAvg(bassRms);
 
+  // ── 3. Silence detection ──────────────────────────────────────────────────
+  // FIXED: threshold lowered from 10.0 → 2.0 so quiet-but-present music
+  // doesn't get mistaken for silence. Adjust SILENCE_THRESH up if your mic
+  // picks up a lot of ambient hiss.
+  if (bassRms < SILENCE_THRESH) {
+    if (silenceCount < 255) silenceCount++;
   } else {
-    // Beat mode
-    if (beat) {
-      beatOnTime = millis();
-      if (!bpmReady || currentBPM <= 0) {
-        triggerPatternMedium();
-      } else if (currentBPM < SLOW_BPM_THRESH) {
-        triggerPatternSlow();
-      } else if (currentBPM < FAST_BPM_THRESH) {
-        triggerPatternMedium();
+    silenceCount = 0;
+  }
+  bool isSilent = (silenceCount > SILENCE_FRAMES);
+
+  if (isSilent) {
+    resetBpmState();
+    flashActive = false;
+  }
+
+  // ── 4. Beat timeout ───────────────────────────────────────────────────────
+  if (lastBeatMs > 0 && (now - lastBeatMs) > BEAT_TIMEOUT_MS) {
+    resetBpmState();
+  }
+
+  // ── 5. Beat detection ─────────────────────────────────────────────────────
+  // FIXED: BEAT_NORM_GATE lowered from 0.15 → 0.08, BEAT_RATIO from 1.4 → 1.25
+  // Combined, these allow weaker mic signals to still trigger beats reliably.
+  bool beat = false;
+  if (!isSilent &&
+      bassRms  > (localAvg * BEAT_RATIO) &&
+      normBass > BEAT_NORM_GATE &&
+      bassRms  > prevBassRms &&
+      (now - lastBeatMs) > MIN_BEAT_MS) {
+
+    beat         = true;
+    flashActive  = true;
+    flashStartMs = now;
+    recordBeat(now);
+  }
+  prevBassRms = bassRms;
+
+  // ── 6. Choose active pattern ──────────────────────────────────────────────
+  uint8_t activePattern;
+  if (!isSilent && normTreble > CHASE_TREBLE_THRESH) {
+    activePattern = 2;
+  } else if (!isSilent && bpmReady &&
+             currentBPM > BPM_MIN && currentBPM < BPM_MAX) {
+    activePattern = 1;
+  } else {
+    activePattern = 0;
+  }
+
+  // ── 7. Render ─────────────────────────────────────────────────────────────
+
+  // ─ PATTERN 0: Beat Flash ──────────────────────────────────────────────────
+  if (activePattern == 0) {
+
+    uint8_t r = 0, g = 0, b = 0;
+
+    if (flashActive) {
+      unsigned long elapsed = now - flashStartMs;
+      float alpha;
+
+      if (elapsed < (unsigned long)FLASH_HOLD_MS) {
+        alpha = 1.0f;
+      } else if (elapsed < (unsigned long)(FLASH_HOLD_MS + FLASH_FADE_MS)) {
+        alpha = 1.0f - (float)(elapsed - FLASH_HOLD_MS) / (float)FLASH_FADE_MS;
       } else {
-        triggerPatternFast();
+        alpha       = 0.0f;
+        flashActive = false;
       }
-    } else {
-      beatFadeOut();
+      r = (uint8_t)(255.0f * alpha);
+      g = (uint8_t)(100.0f * alpha);
+      b = 0;
+    }
+
+    for (uint8_t i = 0; i < LED_COUNT; i++) {
+      strip.setPixelColor(i, strip.Color(r, g, b));
     }
   }
 
-  // Serial log every 300ms
-  static unsigned long lastLog = 0;
-  if (millis() - lastLog > 300) {
-    Serial.print(millis());
-    Serial.print("ms | ");
-    if (mode == 0) {
-      Serial.print("SILENCE       | -");
-    } else if (mode == 1) {
-      Serial.print("MUSIC-ONLY    | -");
+  // ─ PATTERN 1: BPM Breathe ─────────────────────────────────────────────────
+  else if (activePattern == 1) {
+
+    unsigned long period = (unsigned long)(60000.0f / currentBPM);
+    if (period < 2) period = 2;
+    unsigned long half  = period / 2;
+    if (half < 1) half = 1;
+    unsigned long phase = now % period;
+
+    uint8_t bri;
+    if (phase < half) {
+      bri = (uint8_t)((phase * 255UL) / half);
     } else {
-      if      (!bpmReady || currentBPM <= 0)   Serial.print("BEAT (init)   | ?");
-      else if (currentBPM < SLOW_BPM_THRESH) { Serial.print("BEAT SLOW     | "); Serial.print(currentBPM, 0); }
-      else if (currentBPM < FAST_BPM_THRESH) { Serial.print("BEAT MEDIUM   | "); Serial.print(currentBPM, 0); }
-      else                                   { Serial.print("BEAT FAST     | "); Serial.print(currentBPM, 0); }
+      bri = (uint8_t)(((period - phase) * 255UL) / half);
     }
-    Serial.println();
-    lastLog = millis();
+
+    uint8_t r = (uint8_t)((30UL * bri) / 255UL);
+    uint8_t g = 0;
+    uint8_t bv = bri;
+
+    for (uint8_t i = 0; i < LED_COUNT; i++) {
+      strip.setPixelColor(i, strip.Color(r, g, bv));
+    }
+  }
+
+  // ─ PATTERN 2: Chase ───────────────────────────────────────────────────────
+  else {
+
+    float divisor = normTreble * 4.0f;
+    if (divisor < 1.0f) divisor = 1.0f;
+    unsigned long stepMs = (unsigned long)((float)CHASE_BASE_MS / divisor);
+    if (stepMs < 10) stepMs = 10;
+
+    if ((now - lastChaseMs) >= stepMs) {
+      lastChaseMs = now;
+
+      if (beat) chaseDir = (lcgNext() & 1) ? 1 : -1;
+
+      if (chaseDir > 0) {
+        chaseHead = (chaseHead + 1) % LED_COUNT;
+      } else {
+        chaseHead = (chaseHead == 0) ? (uint8_t)(LED_COUNT - 1)
+                                     : (uint8_t)(chaseHead - 1);
+      }
+    }
+
+    for (uint8_t i = 0; i < LED_COUNT; i++) {
+      strip.setPixelColor(i, 0);
+    }
+
+    for (uint8_t w = 0; w < CHASE_WINDOW; w++) {
+      uint8_t px;
+      if (chaseDir > 0) {
+        px = (uint8_t)((chaseHead + LED_COUNT - w) % LED_COUNT);
+      } else {
+        px = (uint8_t)((chaseHead + w) % LED_COUNT);
+      }
+      uint8_t bri = (uint8_t)(255 - w * (255 / CHASE_WINDOW));
+      strip.setPixelColor(px, strip.Color(0, bri, bri / 2));
+    }
+  }
+
+  // ── 8. Silence override ───────────────────────────────────────────────────
+  if (isSilent) {
+    for (uint8_t i = 0; i < LED_COUNT; i++) strip.setPixelColor(i, 0);
+  }
+
+  strip.show();
+
+  // ── 9. Serial debug (every 500 ms) ───────────────────────────────────────
+  static unsigned long lastLog = 0;
+  if (now - lastLog > 500) {
+    lastLog = now;
+    Serial.print("BASS=");    Serial.print(bassRms,    1);
+    Serial.print(" TREB=");   Serial.print(trebleRms,  1);
+    Serial.print(" nB=");     Serial.print(normBass,   2);
+    Serial.print(" nT=");     Serial.print(normTreble, 2);
+    Serial.print(" BPM=");    Serial.print(currentBPM, 0);
+    Serial.print(" PAT=");    Serial.print(activePattern);
+    Serial.print(" beat=");   Serial.print(beat     ? "Y" : "-");
+    Serial.print(" silent="); Serial.println(isSilent ? "Y" : "-");
   }
 }
