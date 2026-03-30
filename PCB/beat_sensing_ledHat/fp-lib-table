@@ -1,0 +1,6 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "op_amps")(type "KiCad")(uri "${KIPRJMOD}/Symbols and Footprints/OP-AMPS/footprints.pretty")(options "")(descr ""))
+  (lib (name "nano")(type "KiCad")(uri "${KIPRJMOD}/Symbols and Footprints/NANO/nano.pretty")(options "")(descr ""))
+  (lib (name "lm324")(type "KiCad")(uri "${KIPRJMOD}/Symbols and Footprints/OP-AMPS/lm324.pretty")(options "")(descr ""))
+)

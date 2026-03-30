@@ -1,0 +1,6 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "IC_14_HOLDER")(type "KiCad")(uri "${KIPRJMOD}/Symbols and Footprints/OP-AMPS/2026-03-16_06-39-24.kicad_sym")(options "")(descr ""))
+  (lib (name "ARDUINO_NANO")(type "KiCad")(uri "${KIPRJMOD}/Symbols and Footprints/NANO/ARDUINO_NANO.kicad_sym")(options "")(descr ""))
+  (lib (name "LM324N_NOPB")(type "KiCad")(uri "${KIPRJMOD}/Symbols and Footprints/OP-AMPS/LM324N_NOPB.kicad_sym")(options "")(descr ""))
+)
